@@ -25,8 +25,13 @@ more images:
     * every image contains at least one *complete* data row (a data row / a
       group of vertically-merged rows is NEVER split across two images),
     * as many additional whole data rows as possible are packed into the
-      same image, as long as the total number of data rows in that image
-      does not exceed --max-rows (default: 40).
+      same image, as long as the total VISIBLE ROW COUNT of those data rows
+      -- i.e. the number of rendered lines, counting both text wrapping and
+      explicit line breaks, NOT the number of logical <w:tr> table rows --
+      does not exceed --max-rows (default: 40). A single data row containing
+      a lot of text can by itself take up many "visible rows"; a table
+      section with long cells will therefore typically only fit 1-3 logical
+      data rows per image, while a table with short cells may fit dozens.
     * Word's own PAGE headers/footers (running titles, logos, page numbers,
       etc.) are always stripped out -- only the table itself is rendered.
 
@@ -57,6 +62,19 @@ Two rendering engines are available via --engine:
       own text-wrapping/layout. Useful if LibreOffice cannot be installed
       in your environment, but is inherently an approximation of Word's
       real layout/font rendering.
+
+Note on how "visible rows" (wrapped lines) are estimated
+----------------------------------------------------------
+Deciding how many logical data rows fit within a --max-rows budget of
+*wrapped lines* requires knowing, in advance, how many lines each cell's
+text will wrap to -- which depends on the real column widths and fonts.
+Both engines therefore share a single lightweight text-wrapping estimator
+(using Pillow + metrically-compatible fonts) purely to COUNT how many lines
+each row will take, regardless of which engine is used to do the actual,
+final pixel rendering of the image. This keeps the row-bucketing decision
+fast (no need to invoke LibreOffice repeatedly just to measure row counts),
+at the cost of the estimate occasionally being off by about one line versus
+Word's own exact line-breaking in edge cases.
 
 Usage
 -----
@@ -96,6 +114,14 @@ DEFAULT_DPI = 150
 DEFAULT_MAX_ROWS = 40
 TWIPS_PER_INCH = 1440.0
 
+# Fixed, nominal DPI used ONLY for estimating how many lines each cell's
+# text will wrap to (for row-bucketing decisions). This is deliberately
+# decoupled from the user's requested output --dpi: the wrapping decision
+# (how many words fit on a line) is scale-invariant, since both the
+# available column width and the glyph advance widths scale together with
+# DPI, so any fixed reference value works equally well here.
+LINE_ESTIMATION_DPI = 150
+
 # How many temporary per-chunk .docx files to hand to a single `soffice`
 # invocation at once. Batching multiple files into one soffice call avoids
 # paying LibreOffice's ~2-3s cold-start cost per file.
@@ -105,17 +131,17 @@ SOFFICE_BATCH_SIZE = 40
 # generous, but NOT absurdly huge, custom page size:
 #   - width  = the table's own real width (from its column grid) + a small
 #              safety buffer, so no column is ever clipped by the page edge.
-#   - height = estimated per-chunk from the number of rows it contains, with
-#              a very generous per-row allowance (to comfortably fit even
-#              heavily-wrapped multi-line cells) rather than one fixed huge
-#              constant -- this keeps the intermediate PDF/PNG small and
-#              fast to rasterize, and (combined with stripping page
-#              headers/footers, see below) ensures the final auto-cropped
-#              image contains ONLY the table, with no large blank gap.
+#   - height = estimated per-chunk from the ESTIMATED VISIBLE-LINE COUNT it
+#              contains, with a generous per-line allowance, rather than one
+#              fixed huge constant -- this keeps the intermediate PDF/PNG
+#              small and fast to rasterize, and (combined with stripping
+#              page headers/footers) ensures the final cropped image
+#              contains ONLY the table, with no large blank gap.
 CHUNK_PAGE_MARGIN_TWIPS = 200  # ~0.14 inch on each side, auto-cropped anyway
 CHUNK_WIDTH_SAFETY_BUFFER_TWIPS = 720  # +0.5 inch safety margin on width
-ROW_HEIGHT_ESTIMATE_TWIPS = 8000  # ~5.6 inch/row upper-bound allowance
-MIN_CHUNK_PAGE_HEIGHT_TWIPS = 40_000
+LINE_HEIGHT_ESTIMATE_TWIPS = 400  # ~0.28 inch per wrapped line, generous upper bound
+ROW_CHROME_ESTIMATE_TWIPS = 200  # extra per-row allowance (cell padding, borders)
+MIN_CHUNK_PAGE_HEIGHT_TWIPS = 6_000
 MAX_CHUNK_PAGE_HEIGHT_TWIPS = 900_000
 
 # Canonical child-element order for CT_TblPrBase (ECMA-376 §17.4), needed
@@ -130,7 +156,8 @@ TBLPR_CHILD_ORDER = [
 ]
 
 # ---------------------------------------------------------------------------
-# Pillow-engine-only constants (used only when --engine pillow is selected)
+# Pillow-engine-only constants (used both by the Pillow rendering engine AND
+# by the shared line-count estimator used for row-bucketing in both engines)
 # ---------------------------------------------------------------------------
 BORDER_COLOR = (0, 0, 0)
 BORDER_WIDTH_PT = 0.5
@@ -226,8 +253,7 @@ def extract_run_format(rPr) -> dict:
 
 def cell_raw_lines(tc) -> list:
     """Return list[list[Segment]]: one inner list per explicit line, where a
-    new explicit line is started by a paragraph boundary or a <w:br/>.
-    (Only used by the Pillow engine.)"""
+    new explicit line is started by a paragraph boundary or a <w:br/>."""
     lines: list = []
     for p in tc.findall(qn("w:p")):
         current: list = []
@@ -272,11 +298,6 @@ def parse_table_grid(table: Table):
     grid is a 2D list [n_rows][n_cols] of CellData objects. Cells that are
     covered by a horizontal (gridSpan) or vertical (vMerge) merge point to the
     SAME CellData instance as their "owner" cell (top-left of the merge).
-
-    This structural information (which cells are merged together, which rows
-    are header rows) is needed by BOTH engines to decide how to split a table
-    into row-chunks. The per-cell text/font/shading info is only consumed by
-    the Pillow engine.
     """
     tbl = table._tbl
     tblGrid = tbl.find(qn("w:tblGrid"))
@@ -382,384 +403,10 @@ def discover_sections(document: Document):
 
 
 # ---------------------------------------------------------------------------
-# Row grouping (bands that must stay together) + chunking (<= max_rows)
-# (shared by both engines)
+# Text-wrapping estimator (shared: used for BOTH the Pillow rendering engine
+# AND, regardless of engine, to estimate how many visible/wrapped lines each
+# row will take, for row-bucketing purposes).
 # ---------------------------------------------------------------------------
-def group_into_bands(grid, data_row_indices, n_cols):
-    bands = []
-    current = []
-    for r in data_row_indices:
-        shares_merge = False
-        if current:
-            prev_r = current[-1]
-            for c in range(n_cols):
-                a, b = grid[r][c], grid[prev_r][c]
-                if a is not None and a is b:
-                    shares_merge = True
-                    break
-        if shares_merge:
-            current.append(r)
-        else:
-            if current:
-                bands.append(current)
-            current = [r]
-    if current:
-        bands.append(current)
-    return bands
-
-
-def build_chunks(bands, max_rows):
-    chunks = []
-    current_rows: list = []
-    current_count = 0
-    for band in bands:
-        band_len = len(band)
-        if current_rows and current_count + band_len > max_rows:
-            chunks.append(current_rows)
-            current_rows = []
-            current_count = 0
-        current_rows.extend(band)
-        current_count += band_len
-    if current_rows:
-        chunks.append(current_rows)
-    return chunks
-
-
-def compute_row_chunks(table: Table, max_rows: int):
-    """Returns (header_rows, chunks, col_widths_twips, grid, n_rows, n_cols)."""
-    col_widths_twips, grid, header_rows, n_rows, n_cols = parse_table_grid(table)
-    data_row_indices = [r for r in range(n_rows) if r not in header_rows]
-    bands = group_into_bands(grid, data_row_indices, n_cols)
-    chunks = build_chunks(bands, max_rows)
-    return header_rows, chunks, col_widths_twips, grid, n_rows, n_cols
-
-
-# ===========================================================================
-# ENGINE 1 (default): LibreOffice-backed rendering
-# ===========================================================================
-def find_soffice(explicit_path: Optional[str]) -> Optional[str]:
-    if explicit_path:
-        return explicit_path if os.path.exists(explicit_path) else None
-
-    for exe_name in ("soffice", "soffice.exe", "libreoffice"):
-        found = shutil.which(exe_name)
-        if found:
-            return found
-
-    system = platform.system()
-    candidates = []
-    if system == "Windows":
-        for base in (
-            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
-            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
-        ):
-            if base:
-                candidates.append(os.path.join(base, "LibreOffice", "program", "soffice.exe"))
-    elif system == "Darwin":
-        candidates.append("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-    else:
-        candidates.extend(["/usr/bin/soffice", "/usr/local/bin/soffice", "/opt/libreoffice/program/soffice"])
-        candidates.extend(glob.glob("/opt/libreoffice*/program/soffice"))
-
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return None
-
-
-def _set_tblpr_child(tblPr, tag_localname: str, attrib: dict):
-    """Get-or-create a direct child of <w:tblPr> named w:{tag_localname},
-    inserting it at the schema-correct position if newly created, then set
-    the given attributes on it. Returns the element."""
-    tag_q = qn(f"w:{tag_localname}")
-    el = tblPr.find(tag_q)
-    if el is None:
-        el = etree.Element(tag_q)
-        try:
-            new_idx = TBLPR_CHILD_ORDER.index(tag_localname)
-        except ValueError:
-            new_idx = len(TBLPR_CHILD_ORDER)
-        insert_at = len(tblPr)
-        for i, child in enumerate(tblPr):
-            child_tag = etree.QName(child).localname
-            try:
-                child_idx = TBLPR_CHILD_ORDER.index(child_tag)
-            except ValueError:
-                child_idx = len(TBLPR_CHILD_ORDER)
-            if child_idx > new_idx:
-                insert_at = i
-                break
-        tblPr.insert(insert_at, el)
-    for k, v in attrib.items():
-        el.set(qn(f"w:{k}"), v)
-    return el
-
-
-def estimate_page_height_twips(n_rows_kept: int) -> int:
-    est = n_rows_kept * ROW_HEIGHT_ESTIMATE_TWIPS
-    return int(min(MAX_CHUNK_PAGE_HEIGHT_TWIPS, max(MIN_CHUNK_PAGE_HEIGHT_TWIPS, est)))
-
-
-def prune_document_to_single_table(docx_path: Path, table_index: int, rows_to_keep: list):
-    """Reload docx_path fresh and strip its body down to ONLY the table at
-    `table_index` (matched by position among top-level <w:tbl> children),
-    keeping only the <w:tr> rows whose indices are in rows_to_keep (in that
-    same relative order).
-
-    Also, to guarantee the final render contains NOTHING but the table
-    itself (no page header/footer, no clipped columns):
-      * strips any headerReference/footerReference from the section
-        properties, so Word's running page header/footer (title, logo,
-        page numbers, etc.) never gets drawn,
-      * forces the table's layout to "fixed" and its indentation to 0 and
-        its declared width to an absolute (dxa) value matching the sum of
-        its own column widths, so the table can never be auto-refitted,
-        indented, or stretched/shrunk to some other width by the layout
-        engine,
-      * sets a custom page size sized (with a safety buffer) to exactly
-        fit the table's real width and an estimated-generous height for
-        the specific number of rows being kept.
-
-    Returns (document, table_width_twips_with_buffer, page_height_twips).
-    """
-    document = Document(str(docx_path))
-    body = document.element.body
-
-    tables = body.findall(qn("w:tbl"))
-    target = tables[table_index]
-
-    sectPr = body.find(qn("w:sectPr"))
-    for child in list(body):
-        if child is not target and child is not sectPr:
-            body.remove(child)
-
-    trs = target.findall(qn("w:tr"))
-    keep_set = set(rows_to_keep)
-    for i, tr in enumerate(trs):
-        if i not in keep_set:
-            target.remove(tr)
-
-    # --- Strip page headers/footers so ONLY the table renders -------------
-    if sectPr is not None:
-        for tag in ("headerReference", "footerReference"):
-            for el in sectPr.findall(qn(f"w:{tag}")):
-                sectPr.remove(el)
-        titlePg = sectPr.find(qn("w:titlePg"))
-        if titlePg is not None:
-            sectPr.remove(titlePg)
-
-    # --- Compute the table's true width from its own column grid ----------
-    tblGrid = target.find(qn("w:tblGrid"))
-    table_width_twips = 0.0
-    if tblGrid is not None:
-        for gridCol in tblGrid.findall(qn("w:gridCol")):
-            w = gridCol.get(qn("w:w"))
-            table_width_twips += float(w) if w else 1000.0
-    if table_width_twips <= 0:
-        table_width_twips = 12000.0
-
-    # --- Lock the table's own layout/indent/width so nothing else (page
-    #     width, autofit, pct-based width, inherited indent) can cause a
-    #     column to be resized, shifted, or clipped ------------------------
-    tblPr = target.find(qn("w:tblPr"))
-    if tblPr is None:
-        tblPr = etree.Element(qn("w:tblPr"))
-        target.insert(0, tblPr)
-
-    _set_tblpr_child(tblPr, "tblLayout", {"type": "fixed"})
-    _set_tblpr_child(tblPr, "tblInd", {"w": "0", "type": "dxa"})
-    _set_tblpr_child(tblPr, "tblW", {"w": str(int(table_width_twips)), "type": "dxa"})
-
-    page_width_twips = int(
-        table_width_twips + 2 * CHUNK_PAGE_MARGIN_TWIPS + CHUNK_WIDTH_SAFETY_BUFFER_TWIPS
-    )
-    page_height_twips = estimate_page_height_twips(len(rows_to_keep))
-
-    if sectPr is None:
-        sectPr = etree.SubElement(body, qn("w:sectPr"))
-
-    for tag in ("w:pgSz", "w:pgMar"):
-        el = sectPr.find(qn(tag))
-        if el is not None:
-            sectPr.remove(el)
-
-    pgSz = etree.SubElement(sectPr, qn("w:pgSz"))
-    pgSz.set(qn("w:w"), str(page_width_twips))
-    pgSz.set(qn("w:h"), str(page_height_twips))
-    pgSz.set(qn("w:orient"), "landscape")
-
-    pgMar = etree.SubElement(sectPr, qn("w:pgMar"))
-    m = str(int(CHUNK_PAGE_MARGIN_TWIPS))
-    for side in ("top", "right", "bottom", "left"):
-        pgMar.set(qn(f"w:{side}"), m)
-    for side in ("header", "footer", "gutter"):
-        pgMar.set(qn(f"w:{side}"), "0")
-
-    return document, table_width_twips, page_width_twips
-
-
-def convert_docx_batch_to_pdf(soffice_path: str, docx_paths: list, out_dir: Path):
-    for i in range(0, len(docx_paths), SOFFICE_BATCH_SIZE):
-        batch = docx_paths[i : i + SOFFICE_BATCH_SIZE]
-        cmd = [
-            soffice_path,
-            "--headless",
-            "--norestore",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            str(out_dir),
-        ] + [str(p) for p in batch]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"LibreOffice conversion failed (exit {result.returncode}):\n"
-                f"stdout: {result.stdout}\nstderr: {result.stderr}"
-            )
-
-
-def render_pdf_to_cropped_png(
-    pdf_path: Path,
-    dpi: int,
-    out_path: Path,
-    table_width_twips: float,
-    pad_px: int = 4,
-):
-    """Rasterize page 1 of the (single-table) PDF and crop it tightly to the
-    table's content.
-
-    The horizontal crop bounds are computed DETERMINISTICALLY from the
-    table's own known width (margin -> margin + table_width), rather than
-    "auto-detected" from whichever pixels happen to be non-white -- this
-    guarantees no column is ever clipped away by a faulty whitespace
-    heuristic. Only the BOTTOM edge (where the table's content actually
-    ends) is auto-detected, since real per-row rendered height depends on
-    Word/LibreOffice's own text wrapping and isn't known in advance.
-    """
-    import fitz  # PyMuPDF
-    from PIL import Image, ImageChops
-
-    pdf_doc = fitz.open(str(pdf_path))
-    n_pages = len(pdf_doc)
-    if n_pages == 0:
-        raise RuntimeError(f"LibreOffice produced an empty PDF for {pdf_path.name}")
-    if n_pages > 1:
-        print(
-            f"  [!] Warning: '{pdf_path.stem}' overflowed onto {n_pages} pages "
-            f"(table content taller than the estimated page height); only the "
-            f"first page was used. Consider lowering --max-rows."
-        )
-
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    page = pdf_doc[0]
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-    bg = Image.new("RGB", img.size, (255, 255, 255))
-    diff = ImageChops.difference(img, bg)
-    bbox = diff.getbbox()
-    top = bbox[1] if bbox else 0
-    bottom = bbox[3] if bbox else img.height
-
-    margin_px = CHUNK_PAGE_MARGIN_TWIPS / TWIPS_PER_INCH * dpi
-    table_width_px = table_width_twips / TWIPS_PER_INCH * dpi
-    left = margin_px
-    right = margin_px + table_width_px
-
-    l = max(0, int(round(left)) - pad_px)
-    r = min(img.width, int(round(right)) + pad_px)
-    t = max(0, top - pad_px)
-    b = min(img.height, bottom + pad_px)
-
-    if r <= l:
-        l, r = 0, img.width
-    if b <= t:
-        t, b = 0, img.height
-
-    img = img.crop((l, t, r, b))
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path, "PNG")
-    pdf_doc.close()
-
-
-def process_docx_libreoffice(docx_path: Path, out_dir: Path, dpi: int, max_rows: int, soffice_path: str, keep_temp: bool):
-    document = Document(str(docx_path))
-    sections = discover_sections(document)
-    if not sections:
-        print(f"  [!] No tables found in {docx_path.name}")
-        return []
-
-    used_names: dict = {}
-    # plan[i] = (out_path, table_index, rows_to_keep, n_data_rows)
-    plan = []
-    for heading_text, table_index, table in sections:
-        base_name = sanitize_filename_part(heading_text or "Section")
-        if base_name in used_names:
-            used_names[base_name] += 1
-            section_name = f"{base_name}_{used_names[base_name]}"
-        else:
-            used_names[base_name] = 1
-            section_name = base_name
-
-        header_rows, chunks, _cw, _grid, n_rows, _n_cols = compute_row_chunks(table, max_rows)
-        if n_rows == 0:
-            continue
-        if not chunks:
-            print(f"  [!] Section '{section_name}': table has no data rows, skipped")
-            continue
-
-        for idx, chunk_rows in enumerate(chunks, start=1):
-            rows_to_keep = sorted(set(header_rows) | set(chunk_rows))
-            out_path = out_dir / f"{section_name}-{idx}.png"
-            plan.append((out_path, table_index, rows_to_keep, len(chunk_rows)))
-
-    if not plan:
-        return []
-
-    tmp_root = Path(tempfile.mkdtemp(prefix="landsdetail2img_"))
-    try:
-        docx_tmp_dir = tmp_root / "docx"
-        pdf_tmp_dir = tmp_root / "pdf"
-        docx_tmp_dir.mkdir(parents=True, exist_ok=True)
-        pdf_tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        temp_docx_paths = []
-        table_widths = []
-        for i, (out_path, table_index, rows_to_keep, _n) in enumerate(plan):
-            pruned_doc, table_width_twips, _page_w = prune_document_to_single_table(
-                docx_path, table_index, rows_to_keep
-            )
-            temp_docx_path = docx_tmp_dir / f"chunk_{i:05d}.docx"
-            pruned_doc.save(str(temp_docx_path))
-            temp_docx_paths.append(temp_docx_path)
-            table_widths.append(table_width_twips)
-
-        print(f"  Rendering {len(temp_docx_paths)} chunk(s) via LibreOffice ...")
-        convert_docx_batch_to_pdf(soffice_path, temp_docx_paths, pdf_tmp_dir)
-
-        generated_files = []
-        for i, (out_path, table_index, rows_to_keep, n_data_rows) in enumerate(plan):
-            pdf_path = pdf_tmp_dir / f"chunk_{i:05d}.pdf"
-            if not pdf_path.exists():
-                print(f"  [!] Missing expected PDF for {out_path.name}, skipped")
-                continue
-            render_pdf_to_cropped_png(pdf_path, dpi, out_path, table_widths[i])
-            generated_files.append(out_path)
-            print(f"  -> {out_path}  ({n_data_rows} data row(s))")
-
-        return generated_files
-    finally:
-        if keep_temp:
-            print(f"  [i] Temp files kept at: {tmp_root}")
-        else:
-            shutil.rmtree(tmp_root, ignore_errors=True)
-
-
-# ===========================================================================
-# ENGINE 2 (fallback): Pillow-backed rendering
-# ===========================================================================
 _system = platform.system()
 if _system == "Windows":
     _win_dir = os.environ.get("WINDIR", r"C:\Windows")
@@ -1004,6 +651,445 @@ def line_height_px(sub_line: list, dpi: int) -> float:
     return max_size * LINE_SPACING_FACTOR
 
 
+def estimate_row_line_counts(grid, col_widths_twips, n_rows, n_cols, dpi=LINE_ESTIMATION_DPI):
+    """For every row, estimate the number of VISIBLE (wrapped) lines its
+    tallest cell will require -- i.e. the same quantity a viewer would count
+    if they looked at the rendered table and counted text lines within that
+    row, including both explicit line breaks and word-wrap. Cells that span
+    multiple rows (vMerge) have their line-count requirement distributed
+    across their row span the same way real row-height distribution works:
+    any excess beyond what the other cells already imply is attributed to
+    the LAST row of the span.
+
+    Returns a list[int] of length n_rows (min 1 per row)."""
+    col_widths_px = [twips_to_px(w, dpi) for w in col_widths_twips]
+    pad_lr_px = twips_to_px(CELL_LEFT_RIGHT_PAD_TWIPS, dpi)
+
+    min_lines = [0] * n_rows
+    seen_ids = set()
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cell = grid[r][c]
+            if cell is None or cell.row0 != r or cell.col0 != c:
+                continue
+            if id(cell) in seen_ids:
+                continue
+            seen_ids.add(id(cell))
+
+            width_px = sum(col_widths_px[cell.col0 : cell.col0 + cell.colspan]) - 2 * pad_lr_px
+            width_px = max(1.0, width_px)
+            sub_lines = wrap_cell_lines(cell, width_px, dpi)
+            n_lines = max(1, len(sub_lines))
+
+            if cell.rowspan == 1:
+                min_lines[r] = max(min_lines[r], n_lines)
+            else:
+                span = range(cell.row0, cell.row0 + cell.rowspan)
+                current_sum = sum(min_lines[rr] for rr in span)
+                if n_lines > current_sum:
+                    min_lines[cell.row0 + cell.rowspan - 1] += n_lines - current_sum
+
+    for r in range(n_rows):
+        if min_lines[r] <= 0:
+            min_lines[r] = 1
+    return min_lines
+
+
+# ---------------------------------------------------------------------------
+# Row grouping (bands that must stay together) + chunking (<= max_rows
+# VISIBLE/WRAPPED LINES, not logical row count) -- shared by both engines.
+# ---------------------------------------------------------------------------
+def group_into_bands(grid, data_row_indices, n_cols):
+    bands = []
+    current = []
+    for r in data_row_indices:
+        shares_merge = False
+        if current:
+            prev_r = current[-1]
+            for c in range(n_cols):
+                a, b = grid[r][c], grid[prev_r][c]
+                if a is not None and a is b:
+                    shares_merge = True
+                    break
+        if shares_merge:
+            current.append(r)
+        else:
+            if current:
+                bands.append(current)
+            current = [r]
+    if current:
+        bands.append(current)
+    return bands
+
+
+def build_chunks(bands, row_weights, max_rows):
+    """Greedily pack bands (groups of rows that must stay together) into
+    chunks, where a chunk's "size" is the SUM of row_weights over all rows
+    in it (row_weights[r] = estimated visible/wrapped line count of row r,
+    NOT simply 1-per-row) -- so a chunk never exceeds max_rows worth of
+    visible lines. A single band that by itself already exceeds max_rows is
+    still kept whole (never split), per spec: a data row must never be split
+    across two images."""
+    chunks = []
+    current_rows: list = []
+    current_weight = 0
+    for band in bands:
+        band_weight = sum(row_weights[r] for r in band)
+        if current_rows and current_weight + band_weight > max_rows:
+            chunks.append(current_rows)
+            current_rows = []
+            current_weight = 0
+        current_rows.extend(band)
+        current_weight += band_weight
+    if current_rows:
+        chunks.append(current_rows)
+    return chunks
+
+
+def compute_row_chunks(table: Table, max_rows: int):
+    """Returns (header_rows, chunks, col_widths_twips, grid, n_rows, n_cols,
+    row_weights)."""
+    col_widths_twips, grid, header_rows, n_rows, n_cols = parse_table_grid(table)
+    row_weights = estimate_row_line_counts(grid, col_widths_twips, n_rows, n_cols)
+    data_row_indices = [r for r in range(n_rows) if r not in header_rows]
+    bands = group_into_bands(grid, data_row_indices, n_cols)
+    chunks = build_chunks(bands, row_weights, max_rows)
+    return header_rows, chunks, col_widths_twips, grid, n_rows, n_cols, row_weights
+
+
+# ===========================================================================
+# ENGINE 1 (default): LibreOffice-backed rendering
+# ===========================================================================
+def find_soffice(explicit_path: Optional[str]) -> Optional[str]:
+    if explicit_path:
+        return explicit_path if os.path.exists(explicit_path) else None
+
+    for exe_name in ("soffice", "soffice.exe", "libreoffice"):
+        found = shutil.which(exe_name)
+        if found:
+            return found
+
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        for base in (
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        ):
+            if base:
+                candidates.append(os.path.join(base, "LibreOffice", "program", "soffice.exe"))
+    elif system == "Darwin":
+        candidates.append("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+    else:
+        candidates.extend(["/usr/bin/soffice", "/usr/local/bin/soffice", "/opt/libreoffice/program/soffice"])
+        candidates.extend(glob.glob("/opt/libreoffice*/program/soffice"))
+
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def _set_tblpr_child(tblPr, tag_localname: str, attrib: dict):
+    """Get-or-create a direct child of <w:tblPr> named w:{tag_localname},
+    inserting it at the schema-correct position if newly created, then set
+    the given attributes on it. Returns the element."""
+    tag_q = qn(f"w:{tag_localname}")
+    el = tblPr.find(tag_q)
+    if el is None:
+        el = etree.Element(tag_q)
+        try:
+            new_idx = TBLPR_CHILD_ORDER.index(tag_localname)
+        except ValueError:
+            new_idx = len(TBLPR_CHILD_ORDER)
+        insert_at = len(tblPr)
+        for i, child in enumerate(tblPr):
+            child_tag = etree.QName(child).localname
+            try:
+                child_idx = TBLPR_CHILD_ORDER.index(child_tag)
+            except ValueError:
+                child_idx = len(TBLPR_CHILD_ORDER)
+            if child_idx > new_idx:
+                insert_at = i
+                break
+        tblPr.insert(insert_at, el)
+    for k, v in attrib.items():
+        el.set(qn(f"w:{k}"), v)
+    return el
+
+
+def estimate_page_height_twips(rows_to_keep: list, row_weights: list) -> int:
+    """Estimate a safe page height (in twips) for a chunk containing the
+    given rows, based on the ESTIMATED VISIBLE LINE COUNT of those rows
+    (not just their count), so the temporary single-table document's custom
+    page is large enough to fit the whole chunk on one page (avoiding
+    unwanted pagination) without being wastefully huge."""
+    total_lines = sum(row_weights[r] for r in rows_to_keep)
+    n_rows = len(rows_to_keep)
+    est = total_lines * LINE_HEIGHT_ESTIMATE_TWIPS + n_rows * ROW_CHROME_ESTIMATE_TWIPS
+    return int(min(MAX_CHUNK_PAGE_HEIGHT_TWIPS, max(MIN_CHUNK_PAGE_HEIGHT_TWIPS, est)))
+
+
+def prune_document_to_single_table(docx_path: Path, table_index: int, rows_to_keep: list, page_height_twips: int):
+    """Reload docx_path fresh and strip its body down to ONLY the table at
+    `table_index` (matched by position among top-level <w:tbl> children),
+    keeping only the <w:tr> rows whose indices are in rows_to_keep (in that
+    same relative order).
+
+    Also, to guarantee the final render contains NOTHING but the table
+    itself (no page header/footer, no clipped columns):
+      * strips any headerReference/footerReference from the section
+        properties, so Word's running page header/footer (title, logo,
+        page numbers, etc.) never gets drawn,
+      * forces the table's layout to "fixed" and its indentation to 0 and
+        its declared width to an absolute (dxa) value matching the sum of
+        its own column widths, so the table can never be auto-refitted,
+        indented, or stretched/shrunk to some other width by the layout
+        engine,
+      * sets a custom page size sized (with a safety buffer) to exactly
+        fit the table's real width and the given estimated page height.
+
+    Returns (document, table_width_twips).
+    """
+    document = Document(str(docx_path))
+    body = document.element.body
+
+    tables = body.findall(qn("w:tbl"))
+    target = tables[table_index]
+
+    sectPr = body.find(qn("w:sectPr"))
+    for child in list(body):
+        if child is not target and child is not sectPr:
+            body.remove(child)
+
+    trs = target.findall(qn("w:tr"))
+    keep_set = set(rows_to_keep)
+    for i, tr in enumerate(trs):
+        if i not in keep_set:
+            target.remove(tr)
+
+    # --- Strip page headers/footers so ONLY the table renders -------------
+    if sectPr is not None:
+        for tag in ("headerReference", "footerReference"):
+            for el in sectPr.findall(qn(f"w:{tag}")):
+                sectPr.remove(el)
+        titlePg = sectPr.find(qn("w:titlePg"))
+        if titlePg is not None:
+            sectPr.remove(titlePg)
+
+    # --- Compute the table's true width from its own column grid ----------
+    tblGrid = target.find(qn("w:tblGrid"))
+    table_width_twips = 0.0
+    if tblGrid is not None:
+        for gridCol in tblGrid.findall(qn("w:gridCol")):
+            w = gridCol.get(qn("w:w"))
+            table_width_twips += float(w) if w else 1000.0
+    if table_width_twips <= 0:
+        table_width_twips = 12000.0
+
+    # --- Lock the table's own layout/indent/width so nothing else (page
+    #     width, autofit, pct-based width, inherited indent) can cause a
+    #     column to be resized, shifted, or clipped ------------------------
+    tblPr = target.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = etree.Element(qn("w:tblPr"))
+        target.insert(0, tblPr)
+
+    _set_tblpr_child(tblPr, "tblLayout", {"type": "fixed"})
+    _set_tblpr_child(tblPr, "tblInd", {"w": "0", "type": "dxa"})
+    _set_tblpr_child(tblPr, "tblW", {"w": str(int(table_width_twips)), "type": "dxa"})
+
+    page_width_twips = int(
+        table_width_twips + 2 * CHUNK_PAGE_MARGIN_TWIPS + CHUNK_WIDTH_SAFETY_BUFFER_TWIPS
+    )
+
+    if sectPr is None:
+        sectPr = etree.SubElement(body, qn("w:sectPr"))
+
+    for tag in ("w:pgSz", "w:pgMar"):
+        el = sectPr.find(qn(tag))
+        if el is not None:
+            sectPr.remove(el)
+
+    pgSz = etree.SubElement(sectPr, qn("w:pgSz"))
+    pgSz.set(qn("w:w"), str(page_width_twips))
+    pgSz.set(qn("w:h"), str(page_height_twips))
+    pgSz.set(qn("w:orient"), "landscape")
+
+    pgMar = etree.SubElement(sectPr, qn("w:pgMar"))
+    m = str(int(CHUNK_PAGE_MARGIN_TWIPS))
+    for side in ("top", "right", "bottom", "left"):
+        pgMar.set(qn(f"w:{side}"), m)
+    for side in ("header", "footer", "gutter"):
+        pgMar.set(qn(f"w:{side}"), "0")
+
+    return document, table_width_twips
+
+
+def convert_docx_batch_to_pdf(soffice_path: str, docx_paths: list, out_dir: Path):
+    for i in range(0, len(docx_paths), SOFFICE_BATCH_SIZE):
+        batch = docx_paths[i : i + SOFFICE_BATCH_SIZE]
+        cmd = [
+            soffice_path,
+            "--headless",
+            "--norestore",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(out_dir),
+        ] + [str(p) for p in batch]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"LibreOffice conversion failed (exit {result.returncode}):\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
+
+def render_pdf_to_cropped_png(
+    pdf_path: Path,
+    dpi: int,
+    out_path: Path,
+    table_width_twips: float,
+    pad_px: int = 4,
+):
+    """Rasterize page 1 of the (single-table) PDF and crop it tightly to the
+    table's content.
+
+    The horizontal crop bounds are computed DETERMINISTICALLY from the
+    table's own known width (margin -> margin + table_width), rather than
+    "auto-detected" from whichever pixels happen to be non-white -- this
+    guarantees no column is ever clipped away by a faulty whitespace
+    heuristic. Only the BOTTOM edge (where the table's content actually
+    ends) is auto-detected, since real per-row rendered height depends on
+    Word/LibreOffice's own text wrapping and isn't known in advance.
+    """
+    import fitz  # PyMuPDF
+    from PIL import Image, ImageChops
+
+    pdf_doc = fitz.open(str(pdf_path))
+    n_pages = len(pdf_doc)
+    if n_pages == 0:
+        raise RuntimeError(f"LibreOffice produced an empty PDF for {pdf_path.name}")
+    if n_pages > 1:
+        print(
+            f"  [!] Warning: '{pdf_path.stem}' overflowed onto {n_pages} pages "
+            f"(table content taller than the estimated page height); only the "
+            f"first page was used. Consider lowering --max-rows."
+        )
+
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    page = pdf_doc[0]
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    diff = ImageChops.difference(img, bg)
+    bbox = diff.getbbox()
+    top = bbox[1] if bbox else 0
+    bottom = bbox[3] if bbox else img.height
+
+    margin_px = CHUNK_PAGE_MARGIN_TWIPS / TWIPS_PER_INCH * dpi
+    table_width_px = table_width_twips / TWIPS_PER_INCH * dpi
+    left = margin_px
+    right = margin_px + table_width_px
+
+    l = max(0, int(round(left)) - pad_px)
+    r = min(img.width, int(round(right)) + pad_px)
+    t = max(0, top - pad_px)
+    b = min(img.height, bottom + pad_px)
+
+    if r <= l:
+        l, r = 0, img.width
+    if b <= t:
+        t, b = 0, img.height
+
+    img = img.crop((l, t, r, b))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, "PNG")
+    pdf_doc.close()
+
+
+def process_docx_libreoffice(docx_path: Path, out_dir: Path, dpi: int, max_rows: int, soffice_path: str, keep_temp: bool):
+    document = Document(str(docx_path))
+    sections = discover_sections(document)
+    if not sections:
+        print(f"  [!] No tables found in {docx_path.name}")
+        return []
+
+    used_names: dict = {}
+    # plan[i] = (out_path, table_index, rows_to_keep, n_data_rows, n_visible_lines)
+    plan = []
+    for heading_text, table_index, table in sections:
+        base_name = sanitize_filename_part(heading_text or "Section")
+        if base_name in used_names:
+            used_names[base_name] += 1
+            section_name = f"{base_name}_{used_names[base_name]}"
+        else:
+            used_names[base_name] = 1
+            section_name = base_name
+
+        header_rows, chunks, _cw, _grid, n_rows, _n_cols, row_weights = compute_row_chunks(table, max_rows)
+        if n_rows == 0:
+            continue
+        if not chunks:
+            print(f"  [!] Section '{section_name}': table has no data rows, skipped")
+            continue
+
+        for idx, chunk_rows in enumerate(chunks, start=1):
+            rows_to_keep = sorted(set(header_rows) | set(chunk_rows))
+            n_visible_lines = sum(row_weights[r] for r in chunk_rows)
+            out_path = out_dir / f"{section_name}-{idx}.png"
+            plan.append((out_path, table_index, rows_to_keep, len(chunk_rows), n_visible_lines, chunk_rows, row_weights))
+
+    if not plan:
+        return []
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="landsdetail2img_"))
+    try:
+        docx_tmp_dir = tmp_root / "docx"
+        pdf_tmp_dir = tmp_root / "pdf"
+        docx_tmp_dir.mkdir(parents=True, exist_ok=True)
+        pdf_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        temp_docx_paths = []
+        table_widths = []
+        for i, (out_path, table_index, rows_to_keep, _n, _nl, _chunk_rows, row_weights) in enumerate(plan):
+            page_h = estimate_page_height_twips(rows_to_keep, row_weights)
+            pruned_doc, table_width_twips = prune_document_to_single_table(
+                docx_path, table_index, rows_to_keep, page_h
+            )
+            temp_docx_path = docx_tmp_dir / f"chunk_{i:05d}.docx"
+            pruned_doc.save(str(temp_docx_path))
+            temp_docx_paths.append(temp_docx_path)
+            table_widths.append(table_width_twips)
+
+        print(f"  Rendering {len(temp_docx_paths)} chunk(s) via LibreOffice ...")
+        convert_docx_batch_to_pdf(soffice_path, temp_docx_paths, pdf_tmp_dir)
+
+        generated_files = []
+        for i, (out_path, table_index, rows_to_keep, n_data_rows, n_visible_lines, _chunk_rows, _rw) in enumerate(plan):
+            pdf_path = pdf_tmp_dir / f"chunk_{i:05d}.pdf"
+            if not pdf_path.exists():
+                print(f"  [!] Missing expected PDF for {out_path.name}, skipped")
+                continue
+            render_pdf_to_cropped_png(pdf_path, dpi, out_path, table_widths[i])
+            generated_files.append(out_path)
+            print(f"  -> {out_path}  ({n_data_rows} data row(s), ~{n_visible_lines} visible line(s))")
+
+        return generated_files
+    finally:
+        if keep_temp:
+            print(f"  [i] Temp files kept at: {tmp_root}")
+        else:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+# ===========================================================================
+# ENGINE 2 (fallback): Pillow-backed rendering
+# ===========================================================================
 def compute_row_heights(grid, col_widths_px, n_rows, n_cols, dpi):
     pad_tb_px = twips_to_px(CELL_TOP_BOTTOM_PAD_TWIPS, dpi)
     min_height = [0.0] * n_rows
@@ -1109,26 +1195,23 @@ def process_docx_pillow(docx_path: Path, out_dir: Path, dpi: int, max_rows: int)
             used_names[base_name] = 1
             section_name = base_name
 
-        col_widths_twips, grid, header_rows, n_rows, n_cols = parse_table_grid(table)
+        header_rows, chunks, col_widths_twips, grid, n_rows, n_cols, row_weights = compute_row_chunks(table, max_rows)
         if n_rows == 0 or n_cols == 0:
             continue
-        col_widths_px = [twips_to_px(w, dpi) for w in col_widths_twips]
-        row_heights = compute_row_heights(grid, col_widths_px, n_rows, n_cols, dpi)
-
-        data_row_indices = [r for r in range(n_rows) if r not in header_rows]
-        bands = group_into_bands(grid, data_row_indices, n_cols)
-        chunks = build_chunks(bands, max_rows)
-
         if not chunks:
             print(f"  [!] Section '{section_name}': table has no data rows, skipped")
             continue
 
+        col_widths_px = [twips_to_px(w, dpi) for w in col_widths_twips]
+        row_heights = compute_row_heights(grid, col_widths_px, n_rows, n_cols, dpi)
+
         for idx, chunk_rows in enumerate(chunks, start=1):
             rows = header_rows + chunk_rows
+            n_visible_lines = sum(row_weights[r] for r in chunk_rows)
             out_path = out_dir / f"{section_name}-{idx}.png"
             render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, dpi, out_path)
             generated_files.append(out_path)
-            print(f"  -> {out_path}  ({len(chunk_rows)} data row(s))")
+            print(f"  -> {out_path}  ({len(chunk_rows)} data row(s), ~{n_visible_lines} visible line(s))")
 
     return generated_files
 
@@ -1151,7 +1234,13 @@ def main():
         "--max-rows",
         type=int,
         default=DEFAULT_MAX_ROWS,
-        help=f"Max data rows packed into a single image (default: {DEFAULT_MAX_ROWS})",
+        help=(
+            f"Max VISIBLE ROWS (rendered lines, counting both text-wrapping and "
+            f"explicit line breaks -- NOT logical table rows) packed into a single "
+            f"image (default: {DEFAULT_MAX_ROWS}). A row with a lot of text may by "
+            f"itself take up many visible rows; long-celled tables will therefore "
+            f"typically pack far fewer than {DEFAULT_MAX_ROWS} logical rows per image."
+        ),
     )
     parser.add_argument(
         "--engine",
