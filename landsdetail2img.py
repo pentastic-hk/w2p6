@@ -28,7 +28,7 @@ more images:
       same image, as long as the total VISIBLE ROW COUNT of those data rows
       -- i.e. the number of rendered lines, counting both text wrapping and
       explicit line breaks, NOT the number of logical <w:tr> table rows --
-      does not exceed --max-rows (default: 40). A single data row containing
+      does not exceed --max-rows (default: 25). A single data row containing
       a lot of text can by itself take up many "visible rows"; a table
       section with long cells will therefore typically only fit 1-3 logical
       data rows per image, while a table with short cells may fit dozens.
@@ -132,7 +132,7 @@ from lxml import etree
 # Configuration defaults (all overridable via CLI flags, see --help)
 # ---------------------------------------------------------------------------
 DEFAULT_DPI = 150
-DEFAULT_MAX_ROWS = 40
+DEFAULT_MAX_ROWS = 25
 TWIPS_PER_INCH = 1440.0
 
 # Suffix appended to an input .docx's own filename (without extension) to
@@ -1249,8 +1249,8 @@ def default_output_dir_for(docx_path: Path) -> Path:
     """Build the default, sibling output folder for a given input .docx
     file: a folder named '<docx-filename-without-extension>-screenshots',
     created next to (in the same parent directory as) the .docx file
-    itself -- e.g. 'C:\\reports\\QC FUP v1.2.docx' ->
-    'C:\\reports\\QC FUP v1.2-screenshots'."""
+    itself -- e.g. 'C:/reports/QC FUP v1.2.docx' ->
+    'C:/reports/QC FUP v1.2-screenshots'."""
     return docx_path.resolve().parent / f"{docx_path.stem}{DEFAULT_OUTPUT_DIR_SUFFIX}"
 
 
