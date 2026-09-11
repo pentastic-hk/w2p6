@@ -135,6 +135,11 @@ DEFAULT_DPI = 150
 DEFAULT_MAX_ROWS = 25
 TWIPS_PER_INCH = 1440.0
 
+# Visible whitespace margin (in inches) always left around the OUTSIDE of a
+# table's outer border in every generated image, so borders are never flush
+# against the image edge and are never at risk of being clipped off.
+DEFAULT_MARGIN_INCHES = 0.08
+
 # Suffix appended to an input .docx's own filename (without extension) to
 # build its default, sibling output folder name when --output-dir is not
 # explicitly given, e.g. "QC FUP v1.2.docx" -> "QC FUP v1.2-screenshots".
@@ -977,18 +982,31 @@ def render_pdf_to_cropped_png(
     dpi: int,
     out_path: Path,
     table_width_twips: float,
-    pad_px: int = 4,
+    margin_px: int,
 ):
-    """Rasterize page 1 of the (single-table) PDF and crop it tightly to the
-    table's content.
+    """Rasterize page 1 of the (single-table) PDF and crop it to the table's
+    content, guaranteeing every border is fully included, plus a visible
+    margin of `margin_px` pixels of whitespace on all four sides.
 
-    The horizontal crop bounds are computed DETERMINISTICALLY from the
-    table's own known width (margin -> margin + table_width), rather than
-    "auto-detected" from whichever pixels happen to be non-white -- this
-    guarantees no column is ever clipped away by a faulty whitespace
-    heuristic. Only the BOTTOM edge (where the table's content actually
-    ends) is auto-detected, since real per-row rendered height depends on
-    Word/LibreOffice's own text wrapping and isn't known in advance.
+    Two independent estimates of the table's true bounding box are combined
+    by taking their UNION (i.e. widening only, never shrinking below
+    either one), so that whichever estimate is more generous in a given
+    direction wins -- this makes it very unlikely for a border or a sliver
+    of cell content to ever be clipped:
+
+      1. A DETERMINISTIC estimate, computed from the table's own known
+         width (page margin -> page margin + table_width). This is exact
+         for the "normal" case, but does not account for the outer border
+         stroke being drawn CENTERED on the table's nominal edge (so up to
+         half the border's stroke width can render just outside the
+         table's nominal bounding box), nor for any cell content that
+         might overflow its assigned column width.
+      2. A WHITESPACE-DETECTED estimate (bounding box of all non-white
+         pixels on the page). Because the temporary single-table document
+         has its page headers/footers stripped and is sized to contain
+         nothing but the table itself, this bbox should equal the table's
+         real rendered extent -- including any border overshoot or content
+         overflow the deterministic estimate would miss.
     """
     import fitz  # PyMuPDF
     from PIL import Image, ImageChops
@@ -1013,18 +1031,22 @@ def render_pdf_to_cropped_png(
     bg = Image.new("RGB", img.size, (255, 255, 255))
     diff = ImageChops.difference(img, bg)
     bbox = diff.getbbox()
-    top = bbox[1] if bbox else 0
-    bottom = bbox[3] if bbox else img.height
 
-    margin_px = CHUNK_PAGE_MARGIN_TWIPS / TWIPS_PER_INCH * dpi
-    table_width_px = table_width_twips / TWIPS_PER_INCH * dpi
-    left = margin_px
-    right = margin_px + table_width_px
+    det_left = CHUNK_PAGE_MARGIN_TWIPS / TWIPS_PER_INCH * dpi
+    det_right = det_left + table_width_twips / TWIPS_PER_INCH * dpi
 
-    l = max(0, int(round(left)) - pad_px)
-    r = min(img.width, int(round(right)) + pad_px)
-    t = max(0, top - pad_px)
-    b = min(img.height, bottom + pad_px)
+    if bbox:
+        left = min(bbox[0], det_left)
+        top = bbox[1]
+        right = max(bbox[2], det_right)
+        bottom = bbox[3]
+    else:
+        left, top, right, bottom = det_left, 0, det_right, img.height
+
+    l = max(0, int(left) - margin_px)
+    t = max(0, int(top) - margin_px)
+    r = min(img.width, int(right + 0.999) + margin_px)
+    b = min(img.height, int(bottom + 0.999) + margin_px)
 
     if r <= l:
         l, r = 0, img.width
@@ -1038,7 +1060,7 @@ def render_pdf_to_cropped_png(
     pdf_doc.close()
 
 
-def process_docx_libreoffice(docx_path: Path, out_dir: Path, dpi: int, max_rows: int, soffice_path: str, keep_temp: bool):
+def process_docx_libreoffice(docx_path: Path, out_dir: Path, dpi: int, max_rows: int, soffice_path: str, keep_temp: bool, margin_px: int = 0):
     document = Document(str(docx_path))
     sections = discover_sections(document)
     if not sections:
@@ -1101,7 +1123,7 @@ def process_docx_libreoffice(docx_path: Path, out_dir: Path, dpi: int, max_rows:
             if not pdf_path.exists():
                 print(f"  [!] Missing expected PDF for {out_path.name}, skipped")
                 continue
-            render_pdf_to_cropped_png(pdf_path, dpi, out_path, table_widths[i])
+            render_pdf_to_cropped_png(pdf_path, dpi, out_path, table_widths[i], margin_px)
             generated_files.append(out_path)
             print(f"  -> {out_path}  ({n_data_rows} data row(s), ~{n_visible_lines} visible line(s))")
 
@@ -1151,18 +1173,22 @@ def compute_row_heights(grid, col_widths_px, n_rows, n_cols, dpi):
     return min_height
 
 
-def render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, dpi, out_path: Path):
+def render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, dpi, out_path: Path, margin_px: int = 0):
     from PIL import Image, ImageDraw
 
     border_w = max(1, round(pt_to_px(BORDER_WIDTH_PT, dpi)))
     pad_lr_px = twips_to_px(CELL_LEFT_RIGHT_PAD_TWIPS, dpi)
     pad_tb_px = twips_to_px(CELL_TOP_BOTTOM_PAD_TWIPS, dpi)
 
+    # Extra "+ border_w" headroom on the table's own canvas ensures the
+    # outline strokes of the rightmost/bottommost borders are never clipped
+    # by the canvas edge (PIL draws rectangle outlines fully within the
+    # given coordinates, but the full stroke width needs room to render).
     width_px = int(round(sum(col_widths_px))) + border_w
     height_px = int(round(sum(row_heights[r] for r in rows))) + border_w
 
-    img = Image.new("RGB", (max(1, width_px), max(1, height_px)), "white")
-    draw = ImageDraw.Draw(img)
+    table_img = Image.new("RGB", (max(1, width_px), max(1, height_px)), "white")
+    draw = ImageDraw.Draw(table_img)
 
     row_index_of = {r: i for i, r in enumerate(rows)}
     y_cursor = 0.0
@@ -1198,11 +1224,19 @@ def render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, 
             x_cursor += col_w
         y_cursor += row_h
 
+    if margin_px > 0:
+        final_img = Image.new(
+            "RGB", (table_img.width + 2 * margin_px, table_img.height + 2 * margin_px), "white"
+        )
+        final_img.paste(table_img, (margin_px, margin_px))
+    else:
+        final_img = table_img
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path, "PNG")
+    final_img.save(out_path, "PNG")
 
 
-def process_docx_pillow(docx_path: Path, out_dir: Path, dpi: int, max_rows: int):
+def process_docx_pillow(docx_path: Path, out_dir: Path, dpi: int, max_rows: int, margin_px: int = 0):
     document = Document(str(docx_path))
     sections = discover_sections(document)
     if not sections:
@@ -1235,7 +1269,7 @@ def process_docx_pillow(docx_path: Path, out_dir: Path, dpi: int, max_rows: int)
             rows = header_rows + chunk_rows
             n_visible_lines = sum(row_weights[r] for r in chunk_rows)
             out_path = out_dir / f"{section_name}-{idx}.png"
-            render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, dpi, out_path)
+            render_rows_to_image_pillow(rows, grid, col_widths_px, row_heights, n_cols, dpi, out_path, margin_px)
             generated_files.append(out_path)
             print(f"  -> {out_path}  ({len(chunk_rows)} data row(s), ~{n_visible_lines} visible line(s))")
 
@@ -1287,6 +1321,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--margin",
+        type=float,
+        default=DEFAULT_MARGIN_INCHES,
+        help=(
+            "Visible whitespace margin, in inches, always kept around the "
+            "OUTSIDE of the table's outer border in every generated image "
+            f"(default: {DEFAULT_MARGIN_INCHES}). Ensures borders are never flush "
+            "against the image edge and are never at risk of being clipped. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--engine",
         choices=["libreoffice", "pillow"],
         default="libreoffice",
@@ -1308,6 +1354,8 @@ def main():
         help="Keep the temporary per-chunk .docx/.pdf files (for debugging the libreoffice engine).",
     )
     args = parser.parse_args()
+
+    margin_px = max(0, round(args.margin * args.dpi))
 
     soffice_path = None
     if args.engine == "libreoffice":
@@ -1345,10 +1393,10 @@ def main():
         print(f"  Output folder: {out_dir}")
         if args.engine == "libreoffice":
             files = process_docx_libreoffice(
-                docx_path, out_dir, args.dpi, args.max_rows, soffice_path, args.keep_temp
+                docx_path, out_dir, args.dpi, args.max_rows, soffice_path, args.keep_temp, margin_px
             )
         else:
-            files = process_docx_pillow(docx_path, out_dir, args.dpi, args.max_rows)
+            files = process_docx_pillow(docx_path, out_dir, args.dpi, args.max_rows, margin_px)
         if files:
             all_generated.extend(files)
 
