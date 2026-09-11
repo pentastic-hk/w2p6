@@ -35,7 +35,21 @@ more images:
     * Word's own PAGE headers/footers (running titles, logos, page numbers,
       etc.) are always stripped out -- only the table itself is rendered.
 
-Output file naming:
+Output location & naming
+-------------------------
+Unless --output-dir is explicitly given, each input .docx gets its own
+output folder, created as a SIBLING of that .docx file (i.e. in the same
+parent directory), named:
+
+    <input-docx-filename-without-extension>-screenshots/
+
+e.g. processing "C:/reports/QC FUP v1.2.docx" (with no -o given) creates
+"C:/reports/QC FUP v1.2-screenshots/" and writes the PNGs there. When
+multiple input .docx files are passed at once and no -o is given, each one
+gets its own such sibling folder. If -o/--output-dir IS explicitly given,
+that single folder is used for every input file instead.
+
+Within a section's output folder, image files are named:
     <section-name>-<1-based index>.png
 
 Rendering engines
@@ -78,10 +92,17 @@ Word's own exact line-breaking in edge cases.
 
 Usage
 -----
-    python landsdetail2img.py "QC FUP v1.2.docx" -o out_dir
-    python landsdetail2img.py report1.docx report2.docx -o out_dir --dpi 200 --max-rows 30
-    python landsdetail2img.py report.docx -o out_dir --engine pillow
-    python landsdetail2img.py report.docx -o out_dir --soffice-path "C:\\Program Files\\LibreOffice\\program\\soffice.exe"
+    python landsdetail2img.py "QC FUP v1.2.docx"
+        -> writes into a sibling folder "QC FUP v1.2-screenshots/"
+
+    python landsdetail2img.py report1.docx report2.docx --dpi 200 --max-rows 30
+        -> each report gets its own sibling "<name>-screenshots/" folder
+
+    python landsdetail2img.py report.docx -o out_dir
+        -> writes into the explicitly given "out_dir/" instead
+
+    python landsdetail2img.py report.docx --engine pillow
+    python landsdetail2img.py report.docx --soffice-path "C:\\Program Files\\LibreOffice\\program\\soffice.exe"
 
 Run `python landsdetail2img.py -h` for the full list of options.
 """
@@ -113,6 +134,11 @@ from lxml import etree
 DEFAULT_DPI = 150
 DEFAULT_MAX_ROWS = 40
 TWIPS_PER_INCH = 1440.0
+
+# Suffix appended to an input .docx's own filename (without extension) to
+# build its default, sibling output folder name when --output-dir is not
+# explicitly given, e.g. "QC FUP v1.2.docx" -> "QC FUP v1.2-screenshots".
+DEFAULT_OUTPUT_DIR_SUFFIX = "-screenshots"
 
 # Fixed, nominal DPI used ONLY for estimating how many lines each cell's
 # text will wrap to (for row-bucketing decisions). This is deliberately
@@ -1219,13 +1245,31 @@ def process_docx_pillow(docx_path: Path, out_dir: Path, dpi: int, max_rows: int)
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+def default_output_dir_for(docx_path: Path) -> Path:
+    """Build the default, sibling output folder for a given input .docx
+    file: a folder named '<docx-filename-without-extension>-screenshots',
+    created next to (in the same parent directory as) the .docx file
+    itself -- e.g. 'C:\\reports\\QC FUP v1.2.docx' ->
+    'C:\\reports\\QC FUP v1.2-screenshots'."""
+    return docx_path.resolve().parent / f"{docx_path.stem}{DEFAULT_OUTPUT_DIR_SUFFIX}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert long Word (.docx) table sections into PNG screenshots."
     )
     parser.add_argument("docx_files", nargs="+", help="One or more source .docx files")
     parser.add_argument(
-        "-o", "--output-dir", default="output", help="Directory to write PNG files into (default: ./output)"
+        "-o",
+        "--output-dir",
+        default=None,
+        help=(
+            "Directory to write PNG files into. If omitted (the default), each "
+            "input .docx gets its own output folder created as a SIBLING of that "
+            "file (i.e. in the same parent folder), named "
+            f"'<docx-filename>{DEFAULT_OUTPUT_DIR_SUFFIX}'. If explicitly given, "
+            "that single folder is used for every input file instead."
+        ),
     )
     parser.add_argument(
         "--dpi", type=int, default=DEFAULT_DPI, help=f"Render resolution in DPI (default: {DEFAULT_DPI})"
@@ -1265,8 +1309,6 @@ def main():
     )
     args = parser.parse_args()
 
-    out_dir = Path(args.output_dir)
-
     soffice_path = None
     if args.engine == "libreoffice":
         soffice_path = find_soffice(args.soffice_path)
@@ -1290,7 +1332,17 @@ def main():
         if not docx_path.exists():
             print(f"[!] File not found: {docx_path}", file=sys.stderr)
             continue
+
+        # If -o/--output-dir was explicitly given, every input file shares
+        # that one folder. Otherwise, each input file gets its own sibling
+        # "<name>-screenshots" folder next to itself.
+        if args.output_dir is not None:
+            out_dir = Path(args.output_dir)
+        else:
+            out_dir = default_output_dir_for(docx_path)
+
         print(f"Processing {docx_path.name} ...")
+        print(f"  Output folder: {out_dir}")
         if args.engine == "libreoffice":
             files = process_docx_libreoffice(
                 docx_path, out_dir, args.dpi, args.max_rows, soffice_path, args.keep_temp
@@ -1300,7 +1352,7 @@ def main():
         if files:
             all_generated.extend(files)
 
-    print(f"\nDone. Generated {len(all_generated)} image(s) in '{out_dir}/'.")
+    print(f"\nDone. Generated {len(all_generated)} image(s).")
 
 
 if __name__ == "__main__":
