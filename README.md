@@ -16,6 +16,19 @@ python landsdetail2img.py "QC FUP v1.2.docx"
 #    -> writes into a sibling folder "QC FUP v1.2-screenshots/"
 ```
 
+## Smart Features
+
+### Auto detection of image height
+
+This script has a line count detection that decides
+whether multiple consecutive rows should be merged into 1 image.
+
+Currently, that default number is 25 visible lines.
+That means, 2 consecutive rows won't be merged into 1 image
+if their total line count exceed 25 lines.
+
+This could be overriden by setting the flag `--max-rows`.
+
 ## The python script filename
 
 It is just a historical reason.
